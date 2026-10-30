@@ -1,5 +1,5 @@
 # music-scripts
-collection of scripts that help with downloading, retagging, renaming, sorting, and converting from flac to aac \
+collection of scripts that help with downloading, retagging, renaming, sorting, and converting from flac to aac 
 
 There are 4 scripts,\
   fix_artist_tags.py \
