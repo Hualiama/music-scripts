@@ -70,56 +70,83 @@ New artists are added with `monitorNewItems: all`, so future releases are monito
 
 ## tagging.py
 
-Identifies each track against MusicBrainz, rewrites its tags, embeds cover art, and files it as `<dest>/<Album Artist>/<Album>/<NN - Title>.<ext>`. Originals are deleted after a successful copy-and-tag unless `--keep-originals` is set. (The file's own docstring calls it `music_organizer.py`.)
+Identifies each folder of music as one MusicBrainz release, scores candidates the way Picard does, and only applies a match scoring at least 0.80. Matched files are retagged, given cover art and filed as `<dest>/<Album Artist>/<Album>/<NN - Title>.<ext>`; everything else is left untouched and listed in `unmatched.txt`. (The file's own docstring calls it `music_organizer.py`.)
 
 **Formats:** mp3, flac, m4a/mp4, ogg, oga, opus.
 
-**Setup (Debian Bookworm):**
+**Setup (Debian Bookworm, Python 3.9+):**
 
 ```
 sudo apt install libchromaprint-tools python3-venv
 python3 -m venv ~/.venvs/musicorg && . ~/.venvs/musicorg/bin/activate
 pip install mutagen pyacoustid musicbrainzngs requests
-export ACOUSTID_API_KEY=xxxxxxxx   # free key: acoustid.org/new-application
+export ACOUSTID_API_KEY=xxxxxxxx   # optional, free: acoustid.org/new-application
 ```
 
 **Usage:**
 
 ```
 ./tagging.py /music/unsorted /music/sorted --contact you@example.com --dry-run
-./tagging.py /music/unsorted /music/sorted --contact you@example.com
+./tagging.py /music/unsorted /music/sorted --contact you@example.com --interactive
+./tagging.py /music/unsorted /music/sorted --contact you@example.com --mb-host localhost:5000 --remote-search
 ```
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `source` | required | Folder scanned recursively |
+| `source` | required | Folder scanned recursively; each subfolder is treated as one album |
 | `dest` | required | Root of the sorted library (files already under it are ignored) |
 | `--contact` | required | Email or URL for the MusicBrainz User-Agent |
-| `--acoustid-key` | `$ACOUSTID_API_KEY` | Enables the fingerprint fallback; without it step 3 is skipped |
-| `--dry-run` | off | Print the planned moves, change nothing |
+| `--dry-run` | off | Print the planned moves, change nothing, don't write `unmatched.txt` |
+| `-i`, `--interactive` | off | Ask when no release reaches `--min-score`, or when two different albums are within 0.02 of each other |
+| `--min-score` | `0.80` | Release score (0–1) needed to apply a match; raise for fewer wrong matches, lower for fewer unmatched |
+| `--candidates` | `6` | Releases fetched and scored per search; more is more thorough but slower |
+| `--prefer-country` | none | Comma list of preferred release countries, e.g. `US,XW` |
+| `--prefer-format` | none | Comma list of preferred media formats, e.g. `"Digital Media,CD"` |
+| `--ignore-existing-ids` | off | Don't trust MusicBrainz IDs already in the files |
+| `--acoustid-key` | `$ACOUSTID_API_KEY` | Enables the fingerprint step; without it step 3 is skipped with a warning |
+| `--acoustid-min` | `0.8` | Minimum AcoustID fingerprint score (0–1) |
+| `--mb-host` | none | Your own MusicBrainz mirror, e.g. `localhost:5000` (plain HTTP, rate limit off) |
+| `--remote-search` | off | With `--mb-host`: send searches to musicbrainz.org at 1/s, lookups to the mirror |
 | `--keep-originals` | off | Copy instead of move |
 | `--no-cover` | off | Don't embed cover art |
-| `--min-score` | `0.8` | Minimum AcoustID match score (0–1) |
 | `--artist-folder` | `albumartist` | Top-level folder from album artist or track artist |
 | `--year-in-album` | off | Name album folders `Album (Year)` |
 
-**How a file is identified.** Files are handled one folder at a time so an album stays together:
+**How a folder is identified.** Each step only handles files the previous steps didn't place:
 
-1. **Album search** (`album-search`): the folder's most common album and album-artist tags are searched on MusicBrainz (score ≥ 85, top 5). Each candidate release is matched track by track on title similarity ≥ 0.85, with a small bonus for matching track numbers. The release that matches the most files wins; official releases break ties.
-2. **Recording search** (`track-search`): each still-unmatched file is searched as a single recording (score ≥ 90) using its title, artist and album, and checked against up to three of that recording's releases.
-3. **AcoustID** (`acoustid`): remaining files are fingerprinted with `fpcalc`. Their candidate releases are pooled and voted on; the top four are scored on vote count, title similarity to the folder's album tag, official status and track-count fit. The best release is used for every file it matches.
+1. **Existing IDs** (`existing-id`): if files already carry `musicbrainz_albumid` tags (e.g. from Picard), the two most common release IDs are fetched and scored. Skipped with `--ignore-existing-ids`.
+2. **Album search** (`album-search`): searches MusicBrainz for the album and artist taken from the majority of the tags, and from the folder name (`Artist - Album (2001) [FLAC]` style, with the parent folder as the artist). Results are pre-ranked on search score, album-title similarity, official status, album type, no secondary types, track count, preferred country and earliest year; the top `--candidates` are fetched and scored.
+3. **Recording search** (`track-search`): each file is searched as a recording by title and artist within ±5 s of its length, then without the length. Up to three recordings scoring at least 0.7 are kept, and two releases of each are scored.
+4. **AcoustID** (`acoustid`): remaining files are fingerprinted and vote on releases; the most-voted `--candidates` releases are scored for the group. Files the vote couldn't place, such as a folder of loose singles, get a per-file attempt.
 
-When tags are missing, the filename is used: a leading track number is stripped and `Artist - Title` is split. Anything still unidentified is left in place and listed in `<dest>/unmatched.txt`.
+When a file has no title tag, it's taken from the filename: a leading disc/track number (`1-03`, `03.`) is parsed and `Artist - Title` is split.
 
-**Tags written:** title, artist, album, album artist, track and disc number with totals, date, label, and MusicBrainz album, release-group, track and recording IDs. MP3s are saved as ID3v2.3. MP4 files get the recording and album IDs only, and no label.
+**How a release is scored** (unknown parts are left out and the weights rescaled):
 
-**Cover art:** the Cover Art Archive (release 1200px, then release group 1200px, then release 500px), falling back to a `cover`, `folder`, `front` or `album` .jpg/.jpeg/.png next to the file.
+| Part | Weight | Measures |
+| --- | --- | --- |
+| Track matches | 45% | Average per-file match; unmatched files count as 0 |
+| Album title | 20% | Similarity to the album tag or folder name |
+| Track count | 12% | Files in the folder vs tracks on the release (not used for single files) |
+| Album artist | 10% | Similarity to the album artist |
+| Release preferences | 10% | Official 1.0, unknown 0.7, other 0.3; Album 1.0, EP 0.8, Single 0.7; compilation/live/remix types 0.4 unless the album tag names them; preferred country and format |
+| Year | 3% | Full within the same year, zero at 5 years apart |
+
+Each file is matched to at most one track, best pairs first. A file–track pair scores title 45%, length 30% (full within 3 s, zero at 20 s), track and disc number 15%, artist 10%. Titles under 0.5 similarity don't match, unless the file's MusicBrainz recording or track ID (or AcoustID result) points at that track, which scores at least 0.9. Title comparison ignores `(feat. X)`, `(Remastered 2011)`, `[Deluxe]` and similar.
+
+**Applying a match:** the best release is applied if it scores at least `--min-score`. Within it, a file whose own pair score is under 0.60 isn't assigned and goes on to the next step. With `--interactive` you're shown up to five candidates (score, year, country, format, track count, status, type, files matched and MusicBrainz link) and can pick one, press `s` to skip, or paste a release MBID or URL; your pick is logged as `manual`.
+
+**Unmatched files** are left in place and logged with their best guess. After a real run, `<dest>/unmatched.txt` lists each one with that guess's score, description and MusicBrainz link, so you can re-run with `--interactive` or fix it by hand.
+
+**MusicBrainz mirror:** `--mb-host` sends every request to your mirror with the rate limit off. If the mirror has no search server, add `--remote-search`: searches then go to musicbrainz.org at one per second while release lookups stay local. Without a mirror, everything is limited to about one request per second; AcoustID lookups are throttled to about three per second.
+
+**Tags written:** title, artist, album, album artist, track and disc number with totals, date, label, and MusicBrainz recording, release-track, album and release-group IDs. MP3s are saved as ID3v2.3. MP4 files get no label or release-group ID.
+
+**Cover art:** the Cover Art Archive (release 1200px, then release group 1200px, then release 500px), falling back to a `cover`, `folder`, `front` or `album` .jpg/.jpeg/.png in the source folder.
 
 **Naming:** multi-disc tracks are numbered `D-NN`. Unsafe characters are replaced with `_`; folder names are capped at 120 characters and filenames at 150. A name clash gets `  (2) `, `  (3) ` and so on.
 
 **Safety:** each file is copied to its destination and tagged there. If tagging fails the copy is removed and the original is untouched. The original is deleted only after tagging succeeds.
-
-**Speed:** MusicBrainz's public API allows about one request per second, and AcoustID lookups are throttled to about three per second, so large folders are slow. Release lookups and covers are cached for the run.
 
 ## deletenonflac.sh
 
@@ -289,5 +316,5 @@ The biggest gap: tag changes made to FLACs after conversion never reach the AAC 
 | `fix_artist_tags.py` | `.aac` (raw ADTS) is in the extension list but mutagen can't write tags to it | Those files most likely error every run and pile up in `corrupt_files.csv` |
 | `fix_artist_tags.py` | Root is the current directory | Running it from the wrong folder treats the wrong first-level folder as the artist |
 | `tagging.py` | Docstring and usage examples call it `music_organizer.py` | Cosmetic; examples in the file use the old name |
-| `tagging.py` | MP4 files get fewer tags (no label, release-group or release-track ID) than MP3/FLAC/Ogg | M4A files are less precisely identified by Navidrome and Lidarr |
+| `tagging.py` | MP4 files get fewer tags (no label or release-group ID) than MP3/FLAC/Ogg | M4A files are less precisely identified by Navidrome and Lidarr |
 | `lidarr_add_artists.py` | In a dry run, an artist listed twice in the CSV shows `[DRY ]` both times | A live run correctly skips the second one |
