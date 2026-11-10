@@ -1,24 +1,26 @@
 ## Overview
 
-Five scripts cover the library pipeline: get music into Lidarr, identify and sort it, normalise artist tags, strip the FLAC tree down to audio, and build an AAC copy. All run on the Debian Bookworm server; the FLAC and AAC libraries live in separate folders.
+Six scripts cover the library pipeline: get music into Lidarr, identify and sort it, strip the FLAC tree down to audio, normalise artist tags, remove duplicates, and build an AAC copy. All run on the Debian Bookworm server; the FLAC and AAC libraries live in separate folders.
 
 | Script | Language | What it does | Changes files? | Safe preview |
 | --- | --- | --- | --- | --- |
 | `lidarr_add_artists.py` | Python 3.7+, stdlib only | Adds artists from a CSV to Lidarr and starts album searches | No (Lidarr only) | `--dry-run` |
 | `tagging.py` | Python 3.9+ | Identifies tracks via MusicBrainz/AcoustID, retags, embeds cover art, moves into `Artist/Album/` | Yes: retags and moves, deletes originals | `--dry-run`, `--keep-originals` |
-| `fix_artist_tags.py` | Python 3.10+ | Sets `artist` and `albumartist` tags to the top-level folder name | Yes: rewrites tags in place | `DRY_RUN = True` (default) |
 | `deletenonflac.sh` | Bash | Deletes every non-`.flac` file and any folder left with no FLAC | Yes: permanent delete | Runs as a dry run unless `--delete` is passed |
+| `fix_artist_tags.py` | Python 3.10+ | Sets `artist` and `albumartist` tags to the top-level folder name | Yes: rewrites tags in place | `DRY_RUN = True` (default) |
+| `dedupe.py` | Python 3.10+ | Finds duplicate tracks by tags (optionally fingerprint-verified) or file hash, keeps the best copy | Yes with `--apply`: quarantines or deletes | Report-only unless `--apply` is passed |
 | `flac_to_aac.py` | Python 3.9+ | Transcodes `/root/flac` to \~196 kbps AAC in `/root/compressed`, copies tags and cover | Writes new files only | None; skips already-valid outputs |
 
 Typical order for new music:
 
 1. `lidarr_add_artists.py` to queue downloads.
-2. `tagging.py` on the new-music folder, then the duplicate-removal script (not in this project yet), then move into the main library.
-3. `fix_artist_tags.py` if folder names and artist tags disagree.
-4. `deletenonflac.sh` on the FLAC tree to clear logs, cue sheets, images and lossy strays.
-5. `flac_to_aac.py` to bring the AAC copy up to date.
+2. `tagging.py` to identify and sort new music.
+3. `deletenonflac.sh` on the FLAC tree to clear logs, cue sheets, images and lossy strays.
+4. `fix_artist_tags.py` to make artist tags match the folder names.
+5. `dedupe.py` to remove duplicate tracks.
+6. `flac_to_aac.py` to bring the AAC copy up to date.
 
-Shared Python packages: `mutagen` (all tag work), `av` / PyAV (conversion), `musicbrainzngs`, `pyacoustid` and `requests` (tagging). `fpcalc` from `libchromaprint-tools` is needed for AcoustID fingerprinting.
+Shared Python packages: `mutagen` (all tag work), `av` / PyAV (conversion), `musicbrainzngs`, `pyacoustid` and `requests` (tagging). `fpcalc` from `libchromaprint-tools` is needed for AcoustID fingerprinting in tagging.py and for dedupe.py --verify.
 
 ## lidarr\_add\_artists.py
 
@@ -119,9 +121,32 @@ When tags are missing, the filename is used: a leading track number is stripped 
 
 **Speed:** MusicBrainz's public API allows about one request per second, and AcoustID lookups are throttled to about three per second, so large folders are slow. Release lookups and covers are cached for the run.
 
+## deletenonflac.sh
+
+Permanently deletes every file and symlink under a directory whose name doesn't end in `.flac` (case-insensitive), then removes any folders left empty. Without `--delete` it only lists what would go.
+
+**Requirements:** Bash and GNU `find` (uses `-printf`, `-delete`, `-iname`).
+
+**Usage:**
+
+```
+./deletenonflac.sh /root/flac            # dry run: list files and folders
+./deletenonflac.sh /root/flac --delete   # delete them
+```
+
+**What gets deleted:** everything that isn't `.flac`, including cover images (`cover.jpg`, `folder.png`), `.cue` sheets, `.log` rip logs, `.m3u` playlists, lyrics files, hidden files such as `.artist_tag_fix_state.json` and `corrupt_files.csv`, and any lossy duplicates. Embedded cover art inside the FLACs is unaffected.
+
+**Dry run output:** the count and list of files, then the folders that contain no FLAC anywhere beneath them (the ones that will be empty afterwards).
+
+**Delete run:** prints each file as it's removed, then each empty folder, removed bottom-up. The target directory itself is never removed. Nothing goes to a trash folder; there's no undo apart from a ZFS snapshot.
+
+The script stops on the first error (`set -euo pipefail`). It exits with an error if no directory is given or the path isn't a directory.
+
 ## fix\_artist\_tags.py
 
 Sets both the `artist` and `albumartist` tags of every audio file to the name of its top-level artist folder, so tags match a `Artist/Album/track` layout. It runs as a dry run until you edit the script.
+
+**Multiple artists must be moved by hand first.** Files whose artist is tagged as two artists, such as `Artist; Other Artist` or `Artist & Featured Artist`, end up in a combined folder like `Artist & Featured Artist/`. This script can't split them: it would write the combined folder name into the tags. Move those albums into the correct artist folder by hand before running it.
 
 **Requirements:** Python 3.10+ (uses `str | None` type syntax) and `mutagen`.
 
@@ -158,26 +183,59 @@ python3 /path/to/fix_artist_tags.py        # writes tags
 
 **Watch out:** the folder name replaces the track artist on every file. Featured-artist credits (`Artist feat. X`) and per-track artists on compilations are overwritten. Run the dry run first and check the log.
 
-## deletenonflac.sh
+## dedupe.py
 
-Permanently deletes every file and symlink under a directory whose name doesn't end in `.flac` (case-insensitive), then removes any folders left empty. Without `--delete` it only lists what would go.
+Finds duplicate tracks and writes a CSV report of every group, marking which copy is kept and which would go. Nothing is removed unless `--apply` is given together with `--quarantine DIR` or `--hard-delete`. (The file's own docstring calls it `dedupe_music.py`.)
 
-**Requirements:** Bash and GNU `find` (uses `-printf`, `-delete`, `-iname`).
+**Requirements:** Python 3.10+ (uses `int.bit_count()`) and `mutagen`. `--verify` also needs `fpcalc` from `libchromaprint-tools`.
 
 **Usage:**
 
 ```
-./deletenonflac.sh /root/flac            # dry run: list files and folders
-./deletenonflac.sh /root/flac --delete   # delete them
+python3 dedupe.py /root/flac --verify                                  # report only
+python3 dedupe.py /root/flac --verify --apply --hard-delete            # delete duplicates
+python3 dedupe.py /root/flac --verify --apply --quarantine /root/dupes # move them aside
 ```
 
-**What gets deleted:** everything that isn't `.flac`, including cover images (`cover.jpg`, `folder.png`), `.cue` sheets, `.log` rip logs, `.m3u` playlists, lyrics files, hidden files such as `.artist_tag_fix_state.json` and `corrupt_files.csv`, and any lossy duplicates. Embedded cover art inside the FLACs is unaffected.
+| Option | Default | Effect |
+| --- | --- | --- |
+| `roots` | required | One or more folders, scanned recursively (macOS `._` files skipped) |
+| `--mode` | `tags` | `tags` = metadata match; `hash` = byte-identical files only |
+| `--tolerance` | `2.0` | Max duration difference in seconds (tags mode) |
+| `--verify` | off | Confirm tag matches with an acoustic fingerprint (tags mode only) |
+| `--min-similarity` | `0.85` | Fingerprint similarity needed with `--verify` |
+| `--ignore-album` | off | Match on artist + title only, so album and compilation copies match |
+| `--cross-format` | off | Let lossless and lossy copies match each other |
+| `--prefer DIR` | none | Always keep the copy under DIR; repeatable |
+| `--report` | `duplicates.csv` | Report path, in the current directory by default |
+| `--apply` | off | Actually remove; needs `--quarantine` or `--hard-delete` |
+| `--quarantine DIR` | none | Move duplicates into DIR; DIR is excluded from scanning |
+| `--hard-delete` | off | Delete duplicates permanently |
+| `--workers` | `8` | Threads for reading tags, hashing and fingerprinting |
 
-**Dry run output:** the count and list of files, then the folders that contain no FLAC anywhere beneath them (the ones that will be empty afterwards).
+**How matching works:**
 
-**Delete run:** prints each file as it's removed, then each empty folder, removed bottom-up. The target directory itself is never removed. Nothing goes to a trash folder; there's no undo apart from a ZFS snapshot.
+- **Tags mode:** files are grouped by normalised artist, album and title (lower-cased, accents and punctuation stripped, a leading "The" dropped), plus whether they're lossless. Artist falls back to album artist; missing tags fall back to the `Artist/Album/NN Title` path layout. Within a group, files whose durations are within `--tolerance` are linked. Files with no duration, title or artist are skipped.
+- **`--verify`:** fingerprints the first 120 seconds of each candidate with `fpcalc` and only links pairs scoring at least 0.85, allowing a small offset for trimmed silence. This keeps live, remastered and alternate versions with identical tags apart.
+- **Hash mode:** files of identical size are hashed with BLAKE2b; only exact byte copies match.
 
-The script stops on the first error (`set -euo pipefail`). It exits with an error if no directory is given or the path isn't a directory.
+Links chain together: if A matches B and B matches C, all three form one group even if A and C wouldn't match directly.
+
+**Which copy is kept** (first difference wins):
+
+1. Under a `--prefer` folder
+2. Lossless (including ALAC)
+3. Higher bit depth, then sample rate, then bitrate
+4. Not named like a copy (`(1)`, `- copy`, `copy 2`)
+5. Has embedded cover art
+6. More tags
+7. Shorter path
+
+Since `deletenonflac.sh` runs first, only FLACs are left, so the lossless and cross-format rules don't come into play; bit depth, sample rate and bitrate usually decide.
+
+**Output:** `duplicates.csv` with group, keep/remove, path, artist, album, title, duration, bitrate (kbps), lossless and size, plus a summary of groups, files and reclaimable space.
+
+**Removal:** `--quarantine` mirrors each file's full path under DIR (`/root/flac/A/B/x.flac` becomes `DIR/root/flac/A/B/x.flac`); name clashes get `.dupN`. Undo with `rsync -a --remove-source-files DIR/ /`. `--hard-delete` unlinks permanently, with no undo apart from a ZFS snapshot.
 
 ## flac\_to\_aac.py
 
@@ -222,9 +280,11 @@ The biggest gap: tag changes made to FLACs after conversion never reach the AAC 
 | Script | Issue | Impact |
 | --- | --- | --- |
 | `flac_to_aac.py` | Skip check looks only at the output, not whether the source FLAC changed | Retagging FLACs (e.g. with `fix_artist_tags.py`) leaves stale tags in the AAC library; delete the affected `.m4a` files to force reconversion |
-| `flac_to_aac.py` | Never removes outputs whose FLAC was deleted, renamed or moved | Orphaned and duplicate `.m4a` files build up in `/root/compressed` |
+| `flac_to_aac.py` | Never removes outputs whose FLAC was deleted, renamed or moved | Duplicates removed by `dedupe.py` keep their `.m4a` in `/root/compressed`, so orphans build up there |
+| `dedupe.py` | Without `--verify`, tags mode links any same-tag tracks within 2 seconds | Live, remastered or alternate versions with identical tags can be marked as duplicates; check the report or use `--verify` |
+| `dedupe.py` | Docstring calls it `dedupe_music.py` | Cosmetic |
 | `deletenonflac.sh` | Header comment says folders are left in place, but `--delete` removes every empty folder | Documentation in the file is wrong; behaviour matches this doc |
-| `deletenonflac.sh` | Deletes everything not ending in `.flac`, including hidden files | Running it on the library root also removes `.artist_tag_fix_state.json` and `corrupt_files.csv`, so the next tag fix starts from scratch |
+| `deletenonflac.sh` | Deletes everything not ending in `.flac`, including hidden files | If `fix_artist_tags.py` uses the same root, its `.artist_tag_fix_state.json` and `corrupt_files.csv` are wiped on every pass, so it rechecks every file and the error history is lost |
 | `fix_artist_tags.py` | Overwrites track artist with the folder name | Loses featured-artist credits and per-track artists on compilations or Various Artists folders |
 | `fix_artist_tags.py` | `.aac` (raw ADTS) is in the extension list but mutagen can't write tags to it | Those files most likely error every run and pile up in `corrupt_files.csv` |
 | `fix_artist_tags.py` | Root is the current directory | Running it from the wrong folder treats the wrong first-level folder as the artist |
